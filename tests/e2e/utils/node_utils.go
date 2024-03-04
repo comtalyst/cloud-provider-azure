@@ -218,9 +218,10 @@ func WaitAutoScaleNodes(cs clientset.Interface, targetNodeCount int, isScaleDown
 	Logf(fmt.Sprintf("waiting for auto-scaling the node... Target node count: %v", targetNodeCount))
 	var nodes []v1.Node
 	var err error
-	poll := 60 * time.Second
+	poll := 30 * time.Second
 	autoScaleTimeOut := 90 * time.Minute
 	nodeConditions := map[string][]v1.NodeCondition{}
+	previousNodeCount := -1
 	if err = wait.PollImmediate(poll, autoScaleTimeOut, func() (bool, error) {
 		nodes, err = GetAgentNodes(cs)
 		if err != nil {
@@ -237,19 +238,98 @@ func WaitAutoScaleNodes(cs clientset.Interface, targetNodeCount int, isScaleDown
 		for _, node := range nodes {
 			nodeConditions[node.Name] = node.Status.Conditions
 		}
+
 		Logf("Detect %v nodes, target %v", len(nodes), targetNodeCount)
-		if len(nodes) > targetNodeCount && !isScaleDown {
+
+		// Overscaling validation
+		if isScaleDown && len(nodes) < targetNodeCount {
+			Logf("error: less nodes than expected, Node conditions: %v", nodeConditions)
+			return false, fmt.Errorf("there are less nodes than expected")
+		} else if !isScaleDown && len(nodes) > targetNodeCount {
 			Logf("error: more nodes than expected, Node conditions: %v", nodeConditions)
-			err = fmt.Errorf("there are more nodes than expected")
-			return false, err
+			return false, fmt.Errorf("there are more nodes than expected")
 		}
-		return (targetNodeCount > len(nodes) && isScaleDown) || targetNodeCount == len(nodes), nil
+
+		// Monotonous autoscaling progress validation
+		if previousNodeCount != -1 {
+			if isScaleDown && previousNodeCount < len(nodes) {
+				Logf("error: unexpected scale up while expecting scale down, Node conditions: %v", nodeConditions)
+				return false, fmt.Errorf("unexpected scale up while expecting scale down")
+			} else if !isScaleDown && previousNodeCount > len(nodes) {
+				Logf("error: unexpected scale down while expecting scale up, Node conditions: %v", nodeConditions)
+				return false, fmt.Errorf("unexpected scale down while expecting scale up")
+			}
+		}
+		previousNodeCount = len(nodes)
+
+		return len(nodes) == targetNodeCount, nil
 	}); errors.Is(err, wait.ErrWaitTimeout) {
-		Logf("Node conditions: %v", nodeConditions)
-		return fmt.Errorf("Fail to get target node count in limited time")
+		err = fmt.Errorf("fail to get target node count in limited time")
 	}
 	Logf("Node conditions: %v", nodeConditions)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// At this point, we assume:
+	// if scale up: len(nodes) >= targetNodeCount
+	// if scale down: len(nodes) <= targetNodeCount
+	// Going to validate if this stays true for the next few minutes.
+	// This will help catching the case such as delayed overscaling or other unexpected scaling operations.
+	Logf(fmt.Sprintf("checking auto-scaled node count stability... Target node count: %v", targetNodeCount))
+	stabilityCheckDuration := 5 * time.Minute // Too delayed unexpected scaling might slip through, but most unlikely
+	if err = wait.PollImmediate(poll, stabilityCheckDuration, func() (bool, error) {
+		nodes, err = GetAgentNodes(cs)
+		if err != nil {
+			if IsRetryableAPIError(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if nodes == nil {
+			err = fmt.Errorf("Unexpected nil node list")
+			return false, err
+		}
+		nodeConditions = map[string][]v1.NodeCondition{}
+		for _, node := range nodes {
+			nodeConditions[node.Name] = node.Status.Conditions
+		}
+
+		Logf("Detect %v nodes, target hold %v", len(nodes), targetNodeCount)
+
+		// Overscaling validation
+		if isScaleDown && len(nodes) < targetNodeCount {
+			Logf("error: less nodes than expected, Node conditions: %v", nodeConditions)
+			return false, fmt.Errorf("there are less nodes than expected")
+		} else if !isScaleDown && len(nodes) > targetNodeCount {
+			Logf("error: more nodes than expected, Node conditions: %v", nodeConditions)
+			return false, fmt.Errorf("there are more nodes than expected")
+		}
+
+		// Monotonous autoscaling progress validation
+		// Will also validate if len(nodes) escapes targetNodeCount
+		if previousNodeCount != -1 {
+			if isScaleDown && previousNodeCount < len(nodes) {
+				Logf("error: unexpected scale up while expecting scale down, Node conditions: %v", nodeConditions)
+				return false, fmt.Errorf("unexpected scale up while expecting scale down")
+			} else if !isScaleDown && previousNodeCount > len(nodes) {
+				Logf("error: unexpected scale down while expecting scale up, Node conditions: %v", nodeConditions)
+				return false, fmt.Errorf("unexpected scale down while expecting scale up")
+			}
+		}
+		previousNodeCount = len(nodes)
+
+		return false, nil
+	}); errors.Is(err, wait.ErrWaitTimeout) {
+		// Survived
+		err = nil
+	}
+	Logf("Node conditions: %v", nodeConditions)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // IsControlPlaneNode returns true if the node has a control-plane role label.
